@@ -7,7 +7,11 @@ The project was built as a hands-on implementation and study of SPH-based fluid 
 ## Demo
 
 <p align="center">
-  <img src="Content/README/demo.gif" width="700">
+  <img src="Content/README/demo.gif" width="700"> 
+
+https://github.com/user-attachments/assets/733e5c4c-5698-4525-a501-34083e9062d8
+
+
 </p>
 
 ---
@@ -52,12 +56,7 @@ For each simulation step:
 8. Resolve boundary collisions.
 
 The resulting particle positions are then rendered to visualize the fluid.
-
-### Why Start With CPU?
-
-The CPU implementation provided a simple environment for understanding and debugging the SPH equations before introducing GPU parallelism.
-
-It also established a reference implementation that could later be compared against the GPU versions.
+<img width="1206" height="680" alt="CPU 2D" src="https://github.com/user-attachments/assets/3f243d7c-4997-404d-b328-5a30e15e19b3" />
 
 ---
 
@@ -110,6 +109,8 @@ Updated Particles
 
 This stage demonstrated the performance advantage of moving the particle simulation onto the GPU and provided the foundation for scaling the simulation to substantially larger particle counts.
 
+https://github.com/user-attachments/assets/f69410ec-ad89-4013-b977-e859e0cdbfa0
+
 ---
 
 # 3. GPU 3D SPH
@@ -134,11 +135,11 @@ Velocity → (vx, vy, vz)
 
 The same density, pressure, viscosity, and integration stages operate over the 3D particle neighborhood.
 
-### Why GPU?
 
-The computational cost of SPH grows rapidly as the number of particles increases because each particle must evaluate interactions with nearby particles.
 
-Moving these operations to compute shaders allows the large number of independent particle calculations to execute in parallel.
+https://github.com/user-attachments/assets/b9f8bdc8-ed3b-4750-b03c-ed818005b0c0
+
+
 
 ---
 
@@ -158,6 +159,7 @@ The particle positions are used to construct an implicit representation of the f
 During rendering, rays are cast through the scene and sampled against the fluid representation to determine where the ray intersects the surface.
 
 The surface normal can then be estimated from the local density field and used for lighting.
+
 
 ```text
 SPH Particles
