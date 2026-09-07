@@ -1,0 +1,66 @@
+#pragma kernel BuildDensityVolume
+
+#include "./SpatialHash3D.hlsl"
+
+StructuredBuffer<float3> _Positions;
+StructuredBuffer<uint> _SortKeys;
+StructuredBuffer<uint> _SortIndices;
+StructuredBuffer<uint> _SpatialOffsets;
+RWTexture3D<float> _DensityVolume;
+
+uint3 _VolumeResolution;
+float3 _VolumeBounds;
+uint _ParticleCount;
+float _SmoothingRadius;
+
+float DensityKernel(float distance, float radius)
+{
+    if (distance >= radius)
+    {
+        return 0.0;
+    }
+
+    float difference = radius - distance;
+    float scale = 15.0 / (2.0 * 3.14159265 * pow(radius, 5));
+    return scale * difference * difference;
+}
+
+[numthreads(4, 4, 4)]
+void BuildDensityVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= _VolumeResolution))
+    {
+        return;
+    }
+
+    float3 uvw = (float3(id) + 0.5) / float3(_VolumeResolution);
+    float3 samplePosition = (uvw - 0.5) * _VolumeBounds;
+    int3 originCell = GetCell3D(samplePosition, _SmoothingRadius);
+    float radiusSquared = _SmoothingRadius * _SmoothingRadius;
+    float density = 0.0;
+
+    for (int offsetIndex = 0; offsetIndex < 27; offsetIndex++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[offsetIndex]);
+        uint key = KeyFromHash(hash, _ParticleCount);
+        uint sortedIndex = _SpatialOffsets[key];
+
+        for (uint j = sortedIndex; j < _ParticleCount; j++)
+        {
+            if (_SortKeys[j] != key)
+            {
+                break;
+            }
+
+            uint particleIndex = _SortIndices[j];
+            float3 offset = _Positions[particleIndex] - samplePosition;
+            float distanceSquared = dot(offset, offset);
+            if (distanceSquared < radiusSquared)
+            {
+                density += DensityKernel(sqrt(distanceSquared), _SmoothingRadius);
+            }
+        }
+    }
+
+    _DensityVolume[id] = density;
+}

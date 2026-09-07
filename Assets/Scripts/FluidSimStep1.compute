@@ -1,0 +1,417 @@
+// Step 1: gravity + integration + boundary collision only.
+// No density/pressure/surface-tension yet — this exists purely to validate
+// buffer setup, dispatch, and instanced rendering before SPH math is added.
+
+#pragma kernel ApplyForcesIntegrateCollide
+#pragma kernel CalculateDensity
+#pragma kernel CalculatePressure
+#pragma kernel CalculateNearPressure
+#pragma kernel CalculateViscosity
+#pragma kernel CalculateColorField
+#pragma kernel CalculateSurfaceTension
+#pragma kernel UpdateVelocities
+#pragma kernel UpdatePositions
+
+RWStructuredBuffer<float2> _Positions;
+RWStructuredBuffer<float2> _Velocities;
+RWStructuredBuffer<float2> _PredictedPositions;
+RWStructuredBuffer<float> _Densities;
+RWStructuredBuffer<float> _Pressure;
+RWStructuredBuffer<float> _NearDensities;
+RWStructuredBuffer<float2> _NearPressureForces;
+RWStructuredBuffer<float2> _PressureForces;
+RWStructuredBuffer<float2> _ViscosityForces;
+RWStructuredBuffer<float2> _ColorFieldNormals;
+RWStructuredBuffer<float> _ColorFieldLaplacians;
+RWStructuredBuffer<float2> _SurfaceTensionForces;
+
+float _DeltaTime;
+float _Gravity;
+float _DampingFactor;
+float _ParticleRadius;
+float2 _SimulationBounds;
+uint _ParticleCount;
+float _SmoothingRadius;
+float _RestDensity;
+float _PressureMultiplier;
+float _ViscosityCoefficient;
+float _SurfaceTensionCoefficient;
+float _SurfaceTensionThreshold;
+float _NearPressureMultiplier;
+
+float DensityKernel(float distance, float radius);
+float PressureKernalDerivative(float distance);
+float ViscosityKernelDerivative(float distance);
+float2 ColorFieldKernelNormal(float2 offset, float distSq, float h);
+float ColorFieldKernelLaplacian(float distSq, float h);
+float2 SpikyGradient(float2 offset, float h);
+float NearDensityKernel(float distance, float h);
+float NearDensityKernelDerivative(float distance, float h);
+
+
+[numthreads(128, 1, 1)]
+void ApplyForcesIntegrateCollide(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+
+    float2 velocity = _Velocities[i];
+    velocity += float2(0, -1) * _Gravity * _DeltaTime;
+    float2 predictedPosition = _Positions[i] + velocity * _DeltaTime;
+
+    //float2 position = _Positions[i];
+    //position += velocity * _DeltaTime;
+
+    _Velocities[i] = velocity;
+    //_Positions[i] = position;
+    _PredictedPositions[i] = predictedPosition;
+}
+
+
+[numthreads(128, 1, 1)]
+void CalculateDensity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+
+    float density = 0.0f;
+    
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        
+        float2 pos_i = _PredictedPositions[i];
+        float2 pos_j = _PredictedPositions[j];
+        float2 diff = pos_i - pos_j;
+        float distSq = dot(diff, diff);
+        float radiusSq = _SmoothingRadius * _SmoothingRadius;
+        if (distSq < radiusSq)
+        {
+            float distance = sqrt(distSq);
+            density += DensityKernel(distance, _SmoothingRadius);
+        }
+    }
+    
+    _Densities[i] = density;
+    
+}
+
+float DensityKernel(float distance, float radius)
+{
+    if (distance >= _SmoothingRadius)
+    {
+        return 0.0f;
+    }
+
+    float q = 1.0f - distance / _SmoothingRadius;
+    return q * q;
+}
+
+[numthreads(128, 1, 1)]
+void CalculatePressure(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+ 
+    _Pressure[i] = max(0,(_Densities[i] - _RestDensity) * _PressureMultiplier);
+    _PressureForces[i] = float2(0, 0);
+    float radiusSquared = _SmoothingRadius * _SmoothingRadius;
+    
+    
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (i == j)
+            continue;
+        
+        float2 offset = _PredictedPositions[j] - _PredictedPositions[i];
+        float distanceSquared = dot(offset, offset);
+        float distance = sqrt(distanceSquared);
+        float2 directionToNeighbour = offset / distance;
+        if (distanceSquared >= radiusSquared || distanceSquared < 0.000001f)
+        {
+            continue;
+        }
+
+        float pressureJ = max(0,(_Densities[j] - _RestDensity)
+                  * _PressureMultiplier);
+        
+        float sharedPressure = (_Pressure[i] + pressureJ) / 2.0f;
+        float2 derivative = SpikyGradient(offset, _SmoothingRadius); // negative
+        float2 force =  (derivative * sharedPressure);
+        _PressureForces[i] += force;
+        //_PressureForces[j] -= force;
+    }
+    
+}
+
+[numthreads(128, 1, 1)]
+void CalculateNearPressure(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float nearDensity = 0.0f;
+    float radiusSquared = _SmoothingRadius * _SmoothingRadius;
+
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (i == j)
+            continue;
+        float2 offset = _PredictedPositions[j] - _PredictedPositions[i];
+        float distanceSquared = dot(offset, offset);
+        if (distanceSquared >= radiusSquared)
+            continue;
+        float distance = sqrt(distanceSquared);
+        nearDensity += NearDensityKernel(distance, _SmoothingRadius);
+    }
+
+    float nearPressure = _NearPressureMultiplier * nearDensity; // NOTE: no max(0, ...) clamp — always repulsive
+    _NearDensities[i] = nearDensity;
+
+    float2 force = float2(0, 0);
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (i == j)
+            continue;
+        float2 offset = _PredictedPositions[j] - _PredictedPositions[i];
+        float distanceSquared = dot(offset, offset);
+        if (distanceSquared >= radiusSquared || distanceSquared < 0.000001f)
+            continue;
+        float distance = sqrt(distanceSquared);
+        float2 directionToNeighbour = offset / distance;
+        float derivative = NearDensityKernelDerivative(distance, _SmoothingRadius);
+        force += directionToNeighbour * (derivative * nearPressure);
+    }
+    _NearPressureForces[i] = force;
+}
+
+float PressureKernalDerivative(float distance)
+{
+    if (distance >= _SmoothingRadius)
+    {
+        return 0.0f;
+    }
+
+    float r = length(distance);
+    if (r >= _SmoothingRadius || r < 1e-6)
+        return 0.0f;
+
+    float x = _SmoothingRadius - r;
+    float scale = -30.0f / (3.14159265f * pow(_SmoothingRadius, 5)) * x * x;
+    return scale * (distance / r);
+}
+
+float2 SpikyGradient(float2 offset, float h)
+{
+    float r = length(offset);
+    if (r >= h || r < 1e-5)
+        return float2(0, 0);
+
+    float x = h - r;
+    
+    float scale = -30.0f / (3.14159265f * h * h * h * h * h) * x * x;
+    return scale * (offset / r); 
+}
+
+float NearDensityKernel(float distance, float h)
+{
+    float q = distance / h;
+    if (q >= 1.0f)
+        return 0.0f;
+    float diff = 1.0f - q;
+    return diff * diff * diff; // steeper falloff than poly6, dominates only at close range
+}
+
+float NearDensityKernelDerivative(float distance, float h)
+{
+    float q = distance / h;
+    if (q >= 1.0f)
+        return 0.0f;
+    float diff = 1.0f - q;
+    return -3.0f * diff * diff / h;
+}
+
+[numthreads(128, 1, 1)]
+void CalculateViscosity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+    //float2 viscosityForce = float2(0, 0);
+    _ViscosityForces[i] = float2(0, 0);
+    float radiusSquared = _SmoothingRadius * _SmoothingRadius;
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (i == j)
+            continue;
+        float2 offset = _PredictedPositions[j] - _PredictedPositions[i];
+        float distanceSquared = dot(offset, offset);
+        if (distanceSquared >= radiusSquared || distanceSquared < 0.000001f)
+        {
+            continue;
+        }
+        float distance = sqrt(distanceSquared);
+        float2 velocityDifference = _Velocities[j] - _Velocities[i];
+        float derivative = ViscosityKernelDerivative(distance); 
+        _ViscosityForces[i]  += -_ViscosityCoefficient * velocityDifference * derivative / _Densities[j];
+    }
+}
+
+float ViscosityKernelDerivative(float distance)
+{
+    if (distance >= _SmoothingRadius)
+    {
+        return 0.0f;
+    }
+
+    float q = 1.0f - distance / _SmoothingRadius;
+    return -2.0f * q / _SmoothingRadius;
+}
+
+[numthreads(128, 1, 1)]
+void CalculateColorField(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+
+    float2 normal = float2(0, 0);
+    float laplacian = 0.0f;
+    float radiusSquared = _SmoothingRadius * _SmoothingRadius;
+
+    for (uint j = 0; j < _ParticleCount; j++)
+    {
+        if (i == j)
+            continue;
+
+        float2 offset = _PredictedPositions[j] - _PredictedPositions[i];
+        float distanceSquared = dot(offset, offset);
+        if (distanceSquared >= radiusSquared || distanceSquared < 0.000001f)
+        {
+            continue;
+        }
+
+        float distance = sqrt(distanceSquared);
+        float2 directionToNeighbour = offset / distance;
+        float densityJ = max(_Densities[j], 0.001f);
+
+        // Calculate the normal
+        float2 normalValue = ColorFieldKernelNormal(offset, distanceSquared, _SmoothingRadius);
+        normal += normalValue / densityJ;
+
+
+        // Calculate the laplacian
+        float laplacianValue = ColorFieldKernelLaplacian(distanceSquared, _SmoothingRadius);
+        laplacian += laplacianValue / densityJ;
+    }
+
+    _ColorFieldNormals[i] = normal;
+    _ColorFieldLaplacians[i] = laplacian;
+}
+
+float2 ColorFieldKernelNormal(float2 offset, float distSq, float h)
+{
+    if (distSq >= h * h)
+        return float2(0, 0);
+    float diff = h * h - distSq;
+    float coeff = -24.0f / (3.14159265f * pow(h, 8));
+    return coeff * diff * diff * offset;
+}
+
+float ColorFieldKernelLaplacian(float distSq, float h)
+{
+    if (distSq >= h * h)
+        return 0;
+    float diff = h * h - distSq;
+    float coeff = -48.0f / (3.14159265f * pow(h, 8));
+    return coeff * diff * (h * h - 3.0f * distSq);
+}
+
+[numthreads(128, 1, 1)]
+void CalculateSurfaceTension(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+    float2 normal = _ColorFieldNormals[i];
+    float laplacian = _ColorFieldLaplacians[i];
+    // Only apply surface tension if the magnitude of the normal exceeds the threshold
+    if (length(normal) > _SurfaceTensionThreshold)
+    {
+        float2 surfaceTensionForce = -_SurfaceTensionCoefficient * laplacian * normalize(normal);
+        _SurfaceTensionForces[i] = surfaceTensionForce;
+    }
+    else
+    {
+        _SurfaceTensionForces[i] = float2(0, 0);
+    }
+}
+
+[numthreads(128, 1, 1)]
+void UpdateVelocities(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+    float2 totalForce = _PressureForces[i] + _ViscosityForces[i] + _SurfaceTensionForces[i] + _NearPressureForces[i];
+    float2 acceleration = totalForce / max(_Densities[i], 0.0001f);
+    _Velocities[i] += acceleration * _DeltaTime;
+}
+
+[numthreads(128, 1, 1)]
+void UpdatePositions(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+    {
+        return;
+    }
+    
+    float2 velocity = _Velocities[i];
+    float2 position = _Positions[i] + velocity * _DeltaTime;
+    
+    float halfWidth = _SimulationBounds.x * 0.5;
+    float halfHeight = _SimulationBounds.y * 0.5;
+
+    if (position.x - _ParticleRadius < -halfWidth)
+    {
+        position.x = -halfWidth + _ParticleRadius;
+        velocity.x *= -_DampingFactor;
+    }
+    else if (position.x + _ParticleRadius > halfWidth)
+    {
+        position.x = halfWidth - _ParticleRadius;
+        velocity.x *= -_DampingFactor;
+    }
+
+    if (position.y - _ParticleRadius < -halfHeight)
+    {
+        position.y = -halfHeight + _ParticleRadius;
+        velocity.y *= -_DampingFactor;
+    }
+    else if (position.y + _ParticleRadius > halfHeight)
+    {
+        position.y = halfHeight - _ParticleRadius;
+        velocity.y *= -_DampingFactor;
+    }
+    
+    _Velocities[i] = velocity;
+    _Positions[i] = position;
+}
