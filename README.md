@@ -306,13 +306,6 @@ https://matthias-research.github.io/pages/publications/sca03.pdf
 
 This work provides the foundation for the particle-based fluid formulation used by the project.
 
-### SPH Tutorial
-
-**SPlisHSPlasH — SPH Tutorial**
-https://sph-tutorial.physics-simulation.org/
-
-Used as a reference for understanding the mathematical formulation and implementation of SPH.
-
 ### Sebastian Lague — Coding Adventure: Simulating Fluids
 
 https://www.youtube.com/watch?v=rSKMYc1CQHE
