@@ -26,11 +26,11 @@ Material:
     m_Ints: []
     m_Floats:
     - _DensityScale: 1.5
-    - _MaxSpeed: 8
-    - _RestDensity: 10
+    - _MaxSpeed: 2
+    - _RestDensity: 15.56
     m_Colors:
-    - _BaseColor: {r: 0.54999995, g: 0.9, b: 1, a: 1}
+    - _BaseColor: {r: 0, g: 0.2, b: 1, a: 1}
     - _Color: {r: 0.54999995, g: 0.9, b: 1, a: 1}
-    - _HighColor: {r: 1, g: 0, b: 0.013311386, a: 1}
+    - _HighColor: {r: 1, g: 0, b: 0, a: 1}
   m_BuildTextureStacks: []
   m_AllowLocking: 1

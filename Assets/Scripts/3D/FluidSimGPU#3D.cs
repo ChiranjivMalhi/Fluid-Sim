@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 public class FluidSimGPU3D : MonoBehaviour
@@ -15,8 +16,14 @@ public class FluidSimGPU3D : MonoBehaviour
     [SerializeField, Min(1)] private int particlesZ = 10;
     [SerializeField, Min(0.01f)] private float particleSpacing = 0.15f;
     [SerializeField, Min(0.001f)] private float particleRadius = 0.05f;
+    [SerializeField, Tooltip("Starting center of the particle grid relative to the simulation bounds center.")]
+    private Vector3 spawnCenter;
     [SerializeField, Min(3)] private int sphereLongitudeSegments = 8;
     [SerializeField, Min(2)] private int sphereLatitudeSegments = 6;
+
+    [Header("Boundary Particles")]
+    [SerializeField, Min(0.1f), Tooltip("Height of the static side walls above the floor.")]
+    private float boundaryWallHeight = 6f;
 
     [Header("Physics")]
     [SerializeField] private float gravity = 9.81f;
@@ -28,11 +35,14 @@ public class FluidSimGPU3D : MonoBehaviour
 
     [Header("Density")]
     [SerializeField, Min(0.01f)] private float smoothingRadius = 0.45f;
-    [SerializeField, Min(0.01f)] private float restDensity = 4.0f;
+    [SerializeField, Min(0.01f), Tooltip("Recomputed at startup from the particle spacing and smoothing radius.")]
+    private float restDensity = 4.0f;
     [SerializeField, Min(0.01f)] private float densityScale = 1.5f;
 
     [Header("Pressure")]
     [SerializeField] private float pressureMultiplier = 50f;
+    [SerializeField, Min(0f), Tooltip("Caps the magnitude of attractive pressure below rest density. Set to zero to disable attraction.")]
+    private float maxNegativePressure;
     [SerializeField] private float nearPressureMultiplier = 50f;
 
     [Header("Viscosity")]
@@ -46,6 +56,7 @@ public class FluidSimGPU3D : MonoBehaviour
     [SerializeField] private bool drawParticleSpheres = true;
 
     private int particleCount;
+    private int fluidCount;
     private int kernelIndex;
     private int densityKernelIndex;
     private int pressureKernelIndex;
@@ -58,18 +69,22 @@ public class FluidSimGPU3D : MonoBehaviour
     private int UpdateVelocitiesKernelIndex;
     private int UpdatePositionsKernelIndex;
 
-    private int sortKernelIndex;
-    private int calculateOffsetsKernelIndex;
-    private int hashParticlesKernelIndex;
-
-    private int clearOffsetsKernelIndex;
+    private const int SortGroupSize = 128;
+    private int clearBucketCountsKernel;
+    private int countParticlesKernel;
+    private int scanBucketCountsKernel;
+    private int addBlockOffsetsKernel;
+    private int scatterParticlesKernel;
     private float accumulatedTime;
-    private int paddedCount;
 
     // Spatial Hashing
     private ComputeBuffer spatialKeysBuffer;
     private ComputeBuffer spatialIndicesBuffer;
     private ComputeBuffer spatialOffsetsBuffer;
+    private ComputeBuffer particleKeysBuffer;
+    private ComputeBuffer bucketCountsBuffer;
+    private readonly List<ComputeBuffer> scanOutputs = new();
+    private readonly List<ComputeBuffer> scanBlockSums = new();
 
     // ComputeBuffers
     private ComputeBuffer positionsBuffer;
@@ -84,7 +99,7 @@ public class FluidSimGPU3D : MonoBehaviour
     // Pressure
     private ComputeBuffer pressureBuffer;
     private ComputeBuffer pressureForcesBuffer;
-    private ComputeBuffer nearPressureForcesBuffer;
+    private ComputeBuffer nearPressureAccelerationsBuffer;
 
     // Viscosity
     private ComputeBuffer viscosityBuffer;
@@ -108,37 +123,61 @@ public class FluidSimGPU3D : MonoBehaviour
     public ComputeBuffer SpatialIndicesBuffer => spatialIndicesBuffer;
     public ComputeBuffer SpatialOffsetsBuffer => spatialOffsetsBuffer;
     public int ParticleCount => particleCount;
+    public int FluidCount => fluidCount;
     public Vector3 SimulationBounds => simulationBounds;
     public float SmoothingRadius => smoothingRadius;
     public Vector3 SimulationCenter => transform.position;
 
-    private void DispatchSort()
+    private void BuildSpatialLookup()
     {
-        int numStages = (int)Mathf.Log(paddedCount, 2);
-        simulationCompute.SetBuffer(sortKernelIndex, "_SortKeys", spatialKeysBuffer);
-        simulationCompute.SetBuffer(sortKernelIndex, "_SortIndices", spatialIndicesBuffer);
-        simulationCompute.SetInt("_SortNumEntries", paddedCount);
+        int groups = SortGroupCount(particleCount);
+        simulationCompute.SetInt("_ParticleCount", particleCount);
+        simulationCompute.SetFloat("_SmoothingRadius", smoothingRadius);
+        simulationCompute.SetBuffer(clearBucketCountsKernel, "_BucketCounts", bucketCountsBuffer);
+        simulationCompute.Dispatch(clearBucketCountsKernel, groups, 1, 1);
 
-        int groups = Mathf.CeilToInt(paddedCount / 2f / 128f);
+        simulationCompute.SetBuffer(countParticlesKernel, "_PredictedPositions", predictedPositionsBuffer);
+        simulationCompute.SetBuffer(countParticlesKernel, "_ParticleKeys", particleKeysBuffer);
+        simulationCompute.SetBuffer(countParticlesKernel, "_BucketCounts", bucketCountsBuffer);
+        simulationCompute.Dispatch(countParticlesKernel, groups, 1, 1);
 
-        for (int stageIndex = 0; stageIndex < numStages; stageIndex++)
+        ComputeBuffer input = bucketCountsBuffer;
+        for (int level = 0; level < scanOutputs.Count; level++)
         {
-            for (int stepIndex = 0; stepIndex <= stageIndex; stepIndex++)
-            {
-                int groupWidth = 1 << (stageIndex - stepIndex);
-                int groupHeight = 2 * groupWidth - 1;
-                simulationCompute.SetInt("_GroupWidth", groupWidth);
-                simulationCompute.SetInt("_GroupHeight", groupHeight);
-                simulationCompute.SetInt("_StepIndex", stepIndex);
-                simulationCompute.Dispatch(sortKernelIndex, groups, 1, 1);
-            }
+            ComputeBuffer sums = scanBlockSums[level];
+            simulationCompute.SetInt("_ScanCount", input.count);
+            simulationCompute.SetBuffer(scanBucketCountsKernel, "_ScanInput", input);
+            simulationCompute.SetBuffer(scanBucketCountsKernel, "_ScanOutput", scanOutputs[level]);
+            simulationCompute.SetBuffer(scanBucketCountsKernel, "_BlockSums", sums);
+            simulationCompute.Dispatch(scanBucketCountsKernel, sums.count, 1, 1);
+            input = sums;
         }
+
+        for (int level = scanOutputs.Count - 2; level >= 0; level--)
+        {
+            simulationCompute.SetInt("_ScanCount", scanOutputs[level].count);
+            simulationCompute.SetBuffer(addBlockOffsetsKernel, "_ScanOutput", scanOutputs[level]);
+            simulationCompute.SetBuffer(addBlockOffsetsKernel, "_BlockOffsets", scanOutputs[level + 1]);
+            simulationCompute.Dispatch(addBlockOffsetsKernel, scanBlockSums[level].count, 1, 1);
+        }
+
+        simulationCompute.SetBuffer(scatterParticlesKernel, "_ParticleKeys", particleKeysBuffer);
+        simulationCompute.SetBuffer(scatterParticlesKernel, "_BucketCounts", bucketCountsBuffer);
+        simulationCompute.SetBuffer(scatterParticlesKernel, "_SpatialOffsets", spatialOffsetsBuffer);
+        simulationCompute.SetBuffer(scatterParticlesKernel, "_SortKeys", spatialKeysBuffer);
+        simulationCompute.SetBuffer(scatterParticlesKernel, "_SortIndices", spatialIndicesBuffer);
+        simulationCompute.Dispatch(scatterParticlesKernel, groups, 1, 1);
     }
+
+    private static int SortGroupCount(int count) => (count - 1) / SortGroupSize + 1;
 
     private void Awake()
     {
-        particleCount = particlesX * particlesY * particlesZ;
-        paddedCount = NextPowerOfTwo(particleCount);
+        restDensity = ComputeLatticeRestDensity();
+        fluidCount = particlesX * particlesY * particlesZ;
+        List<Vector3> boundary = BuildBoundaryParticles();
+        particleCount = fluidCount + boundary.Count;
+        Debug.Log($"Fluid particles: {fluidCount}, boundary particles: {boundary.Count}, rest density: {restDensity:F2}", this);
 
         kernelIndex = simulationCompute.FindKernel("ApplyForcesIntegrateCollide");
         densityKernelIndex = simulationCompute.FindKernel("CalculateDensity");
@@ -150,13 +189,14 @@ public class FluidSimGPU3D : MonoBehaviour
         surfaceTensionKernelIndex = simulationCompute.FindKernel("CalculateSurfaceTension");
         UpdateVelocitiesKernelIndex = simulationCompute.FindKernel("UpdateVelocities");
         UpdatePositionsKernelIndex = simulationCompute.FindKernel("UpdatePositions");
-        hashParticlesKernelIndex = simulationCompute.FindKernel("HashParticles");
-        sortKernelIndex = simulationCompute.FindKernel("BitonicSort");
-        calculateOffsetsKernelIndex = simulationCompute.FindKernel("CalculateOffsets");
-        clearOffsetsKernelIndex = simulationCompute.FindKernel("ClearOffsets");
+        clearBucketCountsKernel = simulationCompute.FindKernel("ClearBucketCounts");
+        countParticlesKernel = simulationCompute.FindKernel("CountParticles");
+        scanBucketCountsKernel = simulationCompute.FindKernel("ScanBucketCounts");
+        addBlockOffsetsKernel = simulationCompute.FindKernel("AddBlockOffsets");
+        scatterParticlesKernel = simulationCompute.FindKernel("ScatterParticles");
 
         CreateBuffers();
-        SpawnParticles();
+        SpawnParticles(boundary);
         CreateSphereMesh();
         SetupArgsBuffer();
 
@@ -170,6 +210,9 @@ public class FluidSimGPU3D : MonoBehaviour
 
         drawBounds = new Bounds(transform.position,
             new Vector3(simulationBounds.x + 10f, simulationBounds.y + 10f, simulationBounds.z + 10f));
+
+        // The renderer can run before the first simulation substep.
+        BuildSpatialLookup();
     }
 
     private void CreateBuffers()
@@ -181,18 +224,30 @@ public class FluidSimGPU3D : MonoBehaviour
         nearDensitiesBuffer = new ComputeBuffer(particleCount, sizeof(float));
         pressureBuffer = new ComputeBuffer(particleCount, sizeof(float));
         pressureForcesBuffer = new ComputeBuffer(particleCount, sizeof(float) * 3);
-        nearPressureForcesBuffer = new ComputeBuffer(particleCount, sizeof(float) * 3);
+        nearPressureAccelerationsBuffer = new ComputeBuffer(particleCount, sizeof(float) * 3);
         viscosityBuffer = new ComputeBuffer(particleCount, sizeof(float) * 3);
         surfaceTensionBuffer = new ComputeBuffer(particleCount, sizeof(float) * 3);
         colorFieldNormalsBuffer = new ComputeBuffer(particleCount, sizeof(float) * 3);
         colorFieldLaplaciansBuffer = new ComputeBuffer(particleCount, sizeof(float));
 
-        spatialKeysBuffer = new ComputeBuffer(paddedCount, sizeof(uint));
-        spatialIndicesBuffer = new ComputeBuffer(paddedCount, sizeof(uint));
+        spatialKeysBuffer = new ComputeBuffer(particleCount, sizeof(uint));
+        spatialIndicesBuffer = new ComputeBuffer(particleCount, sizeof(uint));
         spatialOffsetsBuffer = new ComputeBuffer(particleCount, sizeof(uint));
+        particleKeysBuffer = new ComputeBuffer(particleCount, sizeof(uint));
+        bucketCountsBuffer = new ComputeBuffer(particleCount, sizeof(uint));
+
+        scanOutputs.Add(spatialOffsetsBuffer);
+        int blocks = SortGroupCount(particleCount);
+        scanBlockSums.Add(new ComputeBuffer(blocks, sizeof(uint)));
+        while (blocks > 1)
+        {
+            scanOutputs.Add(new ComputeBuffer(blocks, sizeof(uint)));
+            blocks = SortGroupCount(blocks);
+            scanBlockSums.Add(new ComputeBuffer(blocks, sizeof(uint)));
+        }
     }
 
-    private void SpawnParticles()
+    private void SpawnParticles(List<Vector3> boundary)
     {
         Vector3[] positions = new Vector3[particleCount];
         Vector3[] velocities = new Vector3[particleCount];
@@ -200,7 +255,14 @@ public class FluidSimGPU3D : MonoBehaviour
         float gridWidth = (particlesX - 1) * particleSpacing;
         float gridHeight = (particlesY - 1) * particleSpacing;
         float gridDepth = (particlesZ - 1) * particleSpacing;
-        Vector3 bottomLeft = new Vector3(-gridWidth * 0.5f, -gridHeight * 0.5f, -gridDepth * 0.5f);
+        Vector3 gridHalfSize = new Vector3(gridWidth, gridHeight, gridDepth) * 0.5f;
+        Vector3 centerLimit = Vector3.Max(Vector3.zero,
+            simulationBounds * 0.5f - gridHalfSize - Vector3.one * particleRadius);
+        Vector3 center = new Vector3(
+            Mathf.Clamp(spawnCenter.x, -centerLimit.x, centerLimit.x),
+            Mathf.Clamp(spawnCenter.y, -centerLimit.y, centerLimit.y),
+            Mathf.Clamp(spawnCenter.z, -centerLimit.z, centerLimit.z));
+        Vector3 gridMin = center - gridHalfSize;
 
         int index = 0;
         for (int z = 0; z < particlesZ; z++)
@@ -209,15 +271,80 @@ public class FluidSimGPU3D : MonoBehaviour
             {
                 for (int x = 0; x < particlesX; x++)
                 {
-                    positions[index] = bottomLeft + new Vector3(x * particleSpacing, y * particleSpacing, z * particleSpacing);
-                    velocities[index] = Vector3.zero;
+                    positions[index] = gridMin + new Vector3(x * particleSpacing, y * particleSpacing, z * particleSpacing);
                     index++;
                 }
             }
         }
+        boundary.CopyTo(positions, fluidCount);
         positionsBuffer.SetData(positions);
         predictedPositionsBuffer.SetData(positions);
         velocitiesBuffer.SetData(velocities);
+    }
+
+    private float ComputeLatticeRestDensity()
+    {
+        int cells = Mathf.CeilToInt(smoothingRadius / particleSpacing);
+        float radiusSq = smoothingRadius * smoothingRadius;
+        float spacingSq = particleSpacing * particleSpacing;
+        float sum = 0f;
+
+        for (int x = -cells; x <= cells; x++)
+        for (int y = -cells; y <= cells; y++)
+        for (int z = -cells; z <= cells; z++)
+        {
+            float distanceSq = spacingSq * (x * x + y * y + z * z);
+            if (distanceSq < radiusSq)
+            {
+                float weight = smoothingRadius - Mathf.Sqrt(distanceSq);
+                sum += weight * weight;
+            }
+        }
+
+        return sum * (15f / (2f * Mathf.PI * Mathf.Pow(smoothingRadius, 5f)));
+    }
+
+    private List<Vector3> BuildBoundaryParticles()
+    {
+        int layers = Mathf.CeilToInt(smoothingRadius / particleSpacing);
+        Vector3 half = simulationBounds * 0.5f;
+        float wallTop = Mathf.Min(half.y, -half.y + boundaryWallHeight);
+        var xs = BuildBoundaryAxis(-half.x, half.x, particleSpacing, layers, true);
+        var ys = BuildBoundaryAxis(-half.y, wallTop, particleSpacing, layers, false);
+        var zs = BuildBoundaryAxis(-half.z, half.z, particleSpacing, layers, true);
+
+        var boundary = new List<Vector3>();
+        foreach (var x in xs)
+        foreach (var y in ys)
+        foreach (var z in zs)
+        {
+            if (x.wall || y.wall || z.wall)
+                boundary.Add(new Vector3(x.position, y.position, z.position));
+        }
+
+        return boundary;
+    }
+
+    private static List<(float position, bool wall)> BuildBoundaryAxis(
+        float min, float max, float spacing, int layers, bool upperWall)
+    {
+        // The innermost wall samples are half a spacing outside the collision planes.
+        float first = min - 0.5f * spacing;
+        float last = upperWall ? max + 0.5f * spacing : max;
+        var axis = new List<(float position, bool wall)>();
+
+        for (int layer = layers - 1; layer >= 0; layer--)
+            axis.Add((first - layer * spacing, true));
+
+        int steps = Mathf.Max(1, Mathf.RoundToInt((last - first) / spacing));
+        for (int step = 1; step < steps; step++)
+            axis.Add((Mathf.Lerp(first, last, (float)step / steps), false));
+
+        axis.Add((last, upperWall));
+        for (int layer = 1; upperWall && layer < layers; layer++)
+            axis.Add((last + layer * spacing, true));
+
+        return axis;
     }
 
     private void CreateSphereMesh()
@@ -308,7 +435,7 @@ public class FluidSimGPU3D : MonoBehaviour
     {
         uint[] args = new uint[5];
         args[0] = sphereMesh.GetIndexCount(0);
-        args[1] = (uint)particleCount;
+        args[1] = (uint)fluidCount;
         args[2] = sphereMesh.GetIndexStart(0);
         args[3] = sphereMesh.GetBaseVertex(0);
         args[4] = 0;
@@ -344,18 +471,18 @@ public class FluidSimGPU3D : MonoBehaviour
 
     private void DispatchSimulationStep(float deltaTime)
     {
-        int groups = Mathf.CeilToInt(particleCount / 128f);
-        int paddedGroups = Mathf.CeilToInt(paddedCount / 128f);
+        int groups = SortGroupCount(fluidCount);
 
         simulationCompute.SetFloat("_DeltaTime", deltaTime);
         simulationCompute.SetFloat("_Gravity", Mathf.Abs(gravity));
         simulationCompute.SetFloat("_DampingFactor", dampingFactor);
         simulationCompute.SetFloat("_ParticleRadius", particleRadius);
         simulationCompute.SetVector("_SimulationBounds", simulationBounds);
-        simulationCompute.SetInt("_ParticleCount", particleCount);
+        simulationCompute.SetInt("_FluidCount", fluidCount);
         simulationCompute.SetFloat("_SmoothingRadius", smoothingRadius);
         simulationCompute.SetFloat("_RestDensity", restDensity);
         simulationCompute.SetFloat("_PressureMultiplier", pressureMultiplier);
+        simulationCompute.SetFloat("_MaxNegativePressure", Mathf.Max(0f, maxNegativePressure));
         simulationCompute.SetFloat("_NearPressureMultiplier", nearPressureMultiplier);
         simulationCompute.SetFloat("_ViscosityCoefficient", viscosityMultiplier);
         simulationCompute.SetFloat("_SurfaceTensionCoefficient", surfaceTensionCoefficient);
@@ -366,19 +493,7 @@ public class FluidSimGPU3D : MonoBehaviour
         simulationCompute.SetBuffer(kernelIndex, "_PredictedPositions", predictedPositionsBuffer);
         simulationCompute.Dispatch(kernelIndex, groups, 1, 1);
 
-        simulationCompute.SetBuffer(hashParticlesKernelIndex, "_PredictedPositions", predictedPositionsBuffer);
-        simulationCompute.SetBuffer(hashParticlesKernelIndex, "_SortKeys", spatialKeysBuffer);
-        simulationCompute.SetBuffer(hashParticlesKernelIndex, "_SortIndices", spatialIndicesBuffer);
-        simulationCompute.Dispatch(hashParticlesKernelIndex, paddedGroups, 1, 1);
-
-        DispatchSort();
-
-        simulationCompute.SetBuffer(clearOffsetsKernelIndex, "_SpatialOffsets", spatialOffsetsBuffer);
-        simulationCompute.Dispatch(clearOffsetsKernelIndex, groups, 1, 1);
-
-        simulationCompute.SetBuffer(calculateOffsetsKernelIndex, "_SortKeys", spatialKeysBuffer);
-        simulationCompute.SetBuffer(calculateOffsetsKernelIndex, "_SpatialOffsets", spatialOffsetsBuffer);
-        simulationCompute.Dispatch(calculateOffsetsKernelIndex, groups, 1, 1);
+        BuildSpatialLookup();
 
         simulationCompute.SetBuffer(densityKernelIndex, "_PredictedPositions", predictedPositionsBuffer);
         simulationCompute.SetBuffer(densityKernelIndex, "_Densities", densitiesBuffer);
@@ -394,7 +509,7 @@ public class FluidSimGPU3D : MonoBehaviour
         simulationCompute.SetBuffer(pressureKernelIndex, "_NearDensities", nearDensitiesBuffer);
         simulationCompute.SetBuffer(pressureKernelIndex, "_Pressure", pressureBuffer);
         simulationCompute.SetBuffer(pressureKernelIndex, "_PressureForces", pressureForcesBuffer);
-        simulationCompute.SetBuffer(pressureKernelIndex, "_NearPressureForces", nearPressureForcesBuffer);
+        simulationCompute.SetBuffer(pressureKernelIndex, "_NearPressureAccelerations", nearPressureAccelerationsBuffer);
         simulationCompute.SetBuffer(pressureKernelIndex, "_ViscosityForces", viscosityBuffer);
         simulationCompute.SetBuffer(pressureKernelIndex, "_SortKeys", spatialKeysBuffer);
         simulationCompute.SetBuffer(pressureKernelIndex, "_SortIndices", spatialIndicesBuffer);
@@ -422,7 +537,7 @@ public class FluidSimGPU3D : MonoBehaviour
 
         simulationCompute.SetBuffer(UpdateVelocitiesKernelIndex, "_Velocities", velocitiesBuffer);
         simulationCompute.SetBuffer(UpdateVelocitiesKernelIndex, "_PressureForces", pressureForcesBuffer);
-        simulationCompute.SetBuffer(UpdateVelocitiesKernelIndex, "_NearPressureForces", nearPressureForcesBuffer);
+        simulationCompute.SetBuffer(UpdateVelocitiesKernelIndex, "_NearPressureAccelerations", nearPressureAccelerationsBuffer);
         simulationCompute.SetBuffer(UpdateVelocitiesKernelIndex, "_ViscosityForces", viscosityBuffer);
         simulationCompute.SetBuffer(UpdateVelocitiesKernelIndex, "_SurfaceTensionForces", surfaceTensionBuffer);
         simulationCompute.SetBuffer(UpdateVelocitiesKernelIndex, "_Densities", densitiesBuffer);
@@ -430,7 +545,6 @@ public class FluidSimGPU3D : MonoBehaviour
 
         simulationCompute.SetBuffer(UpdatePositionsKernelIndex, "_Positions", positionsBuffer);
         simulationCompute.SetBuffer(UpdatePositionsKernelIndex, "_Velocities", velocitiesBuffer);
-        simulationCompute.SetBuffer(UpdatePositionsKernelIndex, "_PredictedPositions", predictedPositionsBuffer);
         simulationCompute.Dispatch(UpdatePositionsKernelIndex, groups, 1, 1);
     }
 
@@ -443,7 +557,7 @@ public class FluidSimGPU3D : MonoBehaviour
         densitiesBuffer?.Release();
         pressureBuffer?.Release();
         pressureForcesBuffer?.Release();
-        nearPressureForcesBuffer?.Release();
+        nearPressureAccelerationsBuffer?.Release();
         nearDensitiesBuffer?.Release();
         viscosityBuffer?.Release();
         surfaceTensionBuffer?.Release();
@@ -452,12 +566,12 @@ public class FluidSimGPU3D : MonoBehaviour
         spatialKeysBuffer?.Release();
         spatialIndicesBuffer?.Release();
         spatialOffsetsBuffer?.Release();
-    }
-
-    private int NextPowerOfTwo(int n)
-    {
-        int p = 1;
-        while (p < n) p *= 2;
-        return p;
+        particleKeysBuffer?.Release();
+        bucketCountsBuffer?.Release();
+        // The first output is spatialOffsetsBuffer, already released above.
+        for (int level = 1; level < scanOutputs.Count; level++)
+            scanOutputs[level].Release();
+        foreach (ComputeBuffer sums in scanBlockSums)
+            sums.Release();
     }
 }

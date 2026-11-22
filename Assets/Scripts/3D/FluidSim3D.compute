@@ -8,10 +8,11 @@
 #pragma kernel CalculateSurfaceTension
 #pragma kernel UpdateVelocities
 #pragma kernel UpdatePositions
-#pragma kernel HashParticles
-#pragma kernel BitonicSort
-#pragma kernel CalculateOffsets
-#pragma kernel ClearOffsets
+#pragma kernel ClearBucketCounts
+#pragma kernel CountParticles
+#pragma kernel ScanBucketCounts
+#pragma kernel AddBlockOffsets
+#pragma kernel ScatterParticles
 
 #include "./SpatialHash3D.hlsl"
 
@@ -21,7 +22,7 @@ RWStructuredBuffer<float3> _PredictedPositions;
 RWStructuredBuffer<float> _Densities;
 RWStructuredBuffer<float> _Pressure;
 RWStructuredBuffer<float> _NearDensities;
-RWStructuredBuffer<float3> _NearPressureForces;
+RWStructuredBuffer<float3> _NearPressureAccelerations;
 RWStructuredBuffer<float3> _PressureForces;
 RWStructuredBuffer<float3> _ViscosityForces;
 RWStructuredBuffer<float3> _ColorFieldNormals;
@@ -32,10 +33,14 @@ RWStructuredBuffer<uint> _SortKeys;
 RWStructuredBuffer<uint> _SortIndices;
 RWStructuredBuffer<uint> _SpatialOffsets;
 
-uint _SortNumEntries;
-uint _GroupWidth;
-uint _GroupHeight;
-uint _StepIndex;
+RWStructuredBuffer<uint> _ParticleKeys;
+RWStructuredBuffer<uint> _BucketCounts;
+StructuredBuffer<uint> _ScanInput;
+RWStructuredBuffer<uint> _ScanOutput;
+RWStructuredBuffer<uint> _BlockSums;
+StructuredBuffer<uint> _BlockOffsets;
+uint _ScanCount;
+groupshared uint scanValues[128];
 
 float _DeltaTime;
 float _Gravity;
@@ -43,9 +48,11 @@ float _DampingFactor;
 float _ParticleRadius;
 float3 _SimulationBounds;
 uint _ParticleCount;
+uint _FluidCount;
 float _SmoothingRadius;
 float _RestDensity;
 float _PressureMultiplier;
+float _MaxNegativePressure;
 float _ViscosityCoefficient;
 float _SurfaceTensionCoefficient;
 float _SurfaceTensionThreshold;
@@ -58,106 +65,115 @@ float NearDensityKernelDerivative(float distance, float h);
 float SpikyGradient(float r, float h);
 float3 ColorFieldKernelNormal(float3 offset, float distSq, float h);
 float ColorFieldKernelLaplacian(float distSq, float h);
+float Poly6Kernel(float distance, float h);
 
 // ------------------------------------------------------------
 // Spatial Hashing & Sorting
 // ------------------------------------------------------------
 [numthreads(128, 1, 1)]
-void HashParticles(uint3 id : SV_DispatchThreadID)
+void ClearBucketCounts(uint3 id : SV_DispatchThreadID)
 {
-    uint i = id.x;
-    if (i >= _ParticleCount)
-    {
-        _SortKeys[i] = 0xFFFFFFFF;
-        _SortIndices[i] = i;
-        return;
-    }
-
-    int3 cell = GetCell3D(_PredictedPositions[i], _SmoothingRadius);
-    uint hash = HashCell3D(cell);
-    _SortKeys[i] = KeyFromHash(hash, _ParticleCount);
-    _SortIndices[i] = i;
+    if (id.x < _ParticleCount)
+        _BucketCounts[id.x] = 0;
 }
 
 [numthreads(128, 1, 1)]
-void ClearOffsets(uint3 id : SV_DispatchThreadID)
+void CountParticles(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= _ParticleCount)
         return;
-    _SpatialOffsets[id.x] = _ParticleCount;
+
+    int3 cell = GetCell3D(_PredictedPositions[id.x], _SmoothingRadius);
+    uint key = KeyFromHash(HashCell3D(cell), _ParticleCount);
+    _ParticleKeys[id.x] = key;
+    InterlockedAdd(_BucketCounts[key], 1);
 }
 
 [numthreads(128, 1, 1)]
-void BitonicSort(uint3 id : SV_DispatchThreadID)
+void ScanBucketCounts(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex,
+    uint3 group : SV_GroupID)
 {
-    uint i = id.x;
-    uint hIndex = i & (_GroupWidth - 1);
-    uint indexLeft = hIndex + (_GroupHeight + 1) * (i / _GroupWidth);
-    uint rightStepSize = _StepIndex == 0 ? _GroupHeight - 2 * hIndex : (_GroupHeight + 1) / 2;
-    uint indexRight = indexLeft + rightStepSize;
+    // Tail lanes supply zeros and still reach every group barrier.
+    scanValues[lane] = 0;
+    if (id.x < _ScanCount)
+        scanValues[lane] = _ScanInput[id.x];
+    GroupMemoryBarrierWithGroupSync();
 
-    if (indexRight >= _SortNumEntries)
-        return;
-
-    uint valueLeft = _SortKeys[indexLeft];
-    uint valueRight = _SortKeys[indexRight];
-
-    if (valueLeft > valueRight)
+    // Sum up the tree, then walk it back down to compute exclusive prefixes.
+    for (uint stride = 1; stride < 128; stride *= 2)
     {
-        _SortKeys[indexLeft] = valueRight;
-        _SortKeys[indexRight] = valueLeft;
-
-        uint tmpIndex = _SortIndices[indexLeft];
-        _SortIndices[indexLeft] = _SortIndices[indexRight];
-        _SortIndices[indexRight] = tmpIndex;
+        uint right = (lane + 1) * (2 * stride) - 1;
+        if (right < 128)
+            scanValues[right] += scanValues[right - stride];
+        GroupMemoryBarrierWithGroupSync();
     }
+
+    if (lane == 0)
+    {
+        _BlockSums[group.x] = scanValues[127];
+        scanValues[127] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint stride = 64; stride > 0; stride /= 2)
+    {
+        uint right = (lane + 1) * (2 * stride) - 1;
+        if (right < 128)
+        {
+            uint left = right - stride;
+            uint leftTotal = scanValues[left];
+            scanValues[left] = scanValues[right];
+            scanValues[right] += leftTotal;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (id.x < _ScanCount)
+        _ScanOutput[id.x] = scanValues[lane];
 }
 
 [numthreads(128, 1, 1)]
-void CalculateOffsets(uint3 id : SV_DispatchThreadID)
+void AddBlockOffsets(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
 {
-    uint i = id.x;
-    if (i >= _ParticleCount)
+    if (id.x < _ScanCount)
+        _ScanOutput[id.x] += _BlockOffsets[group.x];
+}
+
+[numthreads(128, 1, 1)]
+void ScatterParticles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ParticleCount)
         return;
 
-    uint key = _SortKeys[i];
-    uint keyPrev = (i == 0) ? 0xFFFFFFFF : _SortKeys[i - 1];
-
-    if (key != keyPrev)
-    {
-        _SpatialOffsets[key] = i;
-    }
+    uint key = _ParticleKeys[id.x];
+    uint remaining;
+    // Claim one slot from the end of the bucket without changing its start offset.
+    InterlockedAdd(_BucketCounts[key], 0xffffffffu, remaining);
+    uint destination = _SpatialOffsets[key] + remaining - 1;
+    _SortKeys[destination] = key;
+    _SortIndices[destination] = id.x;
 }
 
 [numthreads(128, 1, 1)]
 void ApplyForcesIntegrateCollide(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidCount)
         return;
 
     float3 velocity = _Velocities[i];
     velocity.y -= abs(_Gravity) * _DeltaTime;
 
-    float3 predictedPosition = _Positions[i] + velocity * _DeltaTime;
-
-    float halfWidth  = _SimulationBounds.x * 0.5f;
-    float halfHeight = _SimulationBounds.y * 0.5f;
-    float halfDepth  = _SimulationBounds.z * 0.5f;
-
-    predictedPosition = clamp(predictedPosition,
-        float3(-halfWidth + _ParticleRadius, -halfHeight + _ParticleRadius, -halfDepth + _ParticleRadius),
-        float3( halfWidth - _ParticleRadius,  halfHeight - _ParticleRadius,  halfDepth - _ParticleRadius));
-
     _Velocities[i] = velocity;
-    _PredictedPositions[i] = predictedPosition;
+    // Keep the prediction unclamped for density and pressure. UpdatePositions resolves wall collisions.
+    _PredictedPositions[i] = _Positions[i] + velocity * _DeltaTime;
 }
 
 [numthreads(128, 1, 1)]
 void CalculateDensity(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidCount)
         return;
 
     float density = 0.0f;
@@ -168,7 +184,8 @@ void CalculateDensity(uint3 id : SV_DispatchThreadID)
 
     for (int offsetIdx = 0; offsetIdx < 27; offsetIdx++)
     {
-        uint hash = HashCell3D(originCell + offsets3D[offsetIdx]);
+        int3 cell = originCell + offsets3D[offsetIdx];
+        uint hash = HashCell3D(cell);
         uint key = KeyFromHash(hash, _ParticleCount);
         uint currIndex = _SpatialOffsets[key];
 
@@ -178,10 +195,11 @@ void CalculateDensity(uint3 id : SV_DispatchThreadID)
                 break;
 
             uint neighborIndex = _SortIndices[j];
-            float3 diff = _PredictedPositions[neighborIndex] - pos;
+            float3 neighborPosition = _PredictedPositions[neighborIndex];
+            float3 diff = neighborPosition - pos;
             float distSq = dot(diff, diff);
 
-            if (distSq < radiusSq)
+            if (distSq < radiusSq && all(GetCell3D(neighborPosition, _SmoothingRadius) == cell))
             {
                 float distance = sqrt(distSq);
                 density += DensityKernel(distance, _SmoothingRadius);
@@ -194,23 +212,31 @@ void CalculateDensity(uint3 id : SV_DispatchThreadID)
     _NearDensities[i] = nearDensity;
 }
 
+float PressureFromDensity(float density)
+{
+    return max(-_MaxNegativePressure, (density - _RestDensity) * _PressureMultiplier);
+}
+
 [numthreads(128, 1, 1)]
 void CalculatePressure(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidCount)
         return;
 
     float density_i = _Densities[i];
     float nearDensity_i = _NearDensities[i];
 
-    float pressure_i = max(0.0f, (density_i - _RestDensity) * _PressureMultiplier);
+    float pressure_i = PressureFromDensity(density_i);
     float nearPressure_i = nearDensity_i * _NearPressureMultiplier;
     _Pressure[i] = pressure_i;
 
     float3 pressureForce = float3(0, 0, 0);
+    float3 nearPressureAcceleration = float3(0, 0, 0);
     float3 viscosityForce = float3(0, 0, 0);
     float radiusSquared = _SmoothingRadius * _SmoothingRadius;
+    float invDensityI = rcp(max(density_i, 0.0001f));
+    float invNearDensityI = rcp(max(nearDensity_i, 0.001f));
 
     float3 pos = _PredictedPositions[i];
     float3 vel = _Velocities[i];
@@ -218,7 +244,8 @@ void CalculatePressure(uint3 id : SV_DispatchThreadID)
 
     for (int offsetIdx = 0; offsetIdx < 27; offsetIdx++)
     {
-        uint hash = HashCell3D(originCell + offsets3D[offsetIdx]);
+        int3 cell = originCell + offsets3D[offsetIdx];
+        uint hash = HashCell3D(cell);
         uint key = KeyFromHash(hash, _ParticleCount);
         uint currIndex = _SpatialOffsets[key];
 
@@ -231,37 +258,54 @@ void CalculatePressure(uint3 id : SV_DispatchThreadID)
             if (i == neighborIndex)
                 continue;
 
-            float3 offset = _PredictedPositions[neighborIndex] - pos;
+            float3 neighborPosition = _PredictedPositions[neighborIndex];
+            float3 offset = neighborPosition - pos;
             float distanceSquared = dot(offset, offset);
 
             if (distanceSquared >= radiusSquared || distanceSquared < 1e-8f)
                 continue;
 
+            if (any(GetCell3D(neighborPosition, _SmoothingRadius) != cell))
+                continue;
+
             float distance = sqrt(distanceSquared);
             float3 dirToNeighbour = offset / distance;
+            float derivative = SpikyGradient(distance, _SmoothingRadius);
+            float nearDerivative = NearDensityKernelDerivative(distance, _SmoothingRadius);
+
+            if (neighborIndex >= _FluidCount)
+            {
+                // Static walls mirror the fluid state and only exert repulsion.
+                pressureForce += dirToNeighbour * (derivative * max(pressure_i, 0.0f) * invDensityI);
+                nearPressureAcceleration += dirToNeighbour *
+                    (nearDerivative * nearPressure_i * invDensityI * invNearDensityI);
+                continue;
+            }
 
             float density_j = _Densities[neighborIndex];
             float nearDensity_j = _NearDensities[neighborIndex];
 
-            float pressure_j = max(0.0f, (density_j - _RestDensity) * _PressureMultiplier);
+            float pressure_j = PressureFromDensity(density_j);
             float nearPressure_j = nearDensity_j * _NearPressureMultiplier;
 
             float sharedPressure = (pressure_i + pressure_j) * 0.5f;
             float sharedNearPressure = (nearPressure_i + nearPressure_j) * 0.5f;
 
-            float derivative = SpikyGradient(distance, _SmoothingRadius);
-            float nearDerivative = NearDensityKernelDerivative(distance, _SmoothingRadius);
 
-            pressureForce += dirToNeighbour * (derivative * sharedPressure) / max(density_j, 0.001f);
-            pressureForce += dirToNeighbour * (nearDerivative * sharedNearPressure) / max(nearDensity_j, 0.001f);
+            float invDensityJ = rcp(max(density_j, 0.0001f));
+            float invNearDensityJ = rcp(max(nearDensity_j, 0.001f));
+            pressureForce += dirToNeighbour * (derivative * sharedPressure * invDensityJ);
+
+            float nearWeight = 0.5f * (invDensityI * invNearDensityJ + invDensityJ * invNearDensityI);
+            nearPressureAcceleration += dirToNeighbour * (nearDerivative * sharedNearPressure * nearWeight);
 
             float3 velDiff = _Velocities[neighborIndex] - vel;
-            viscosityForce += velDiff * DensityKernel(distance, _SmoothingRadius);
+            viscosityForce += velDiff * Poly6Kernel(distance, _SmoothingRadius);
         }
     }
 
     _PressureForces[i] = pressureForce;
-    _NearPressureForces[i] = float3(0, 0, 0);
+    _NearPressureAccelerations[i] = nearPressureAcceleration;
     _ViscosityForces[i] = viscosityForce * _ViscosityCoefficient;
 }
 
@@ -279,7 +323,7 @@ void CalculateViscosity(uint3 id : SV_DispatchThreadID) { }
 void CalculateColorField(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidCount)
         return;
 
     float3 normal = float3(0, 0, 0);
@@ -291,7 +335,8 @@ void CalculateColorField(uint3 id : SV_DispatchThreadID)
 
     for (int offsetIdx = 0; offsetIdx < 27; offsetIdx++)
     {
-        uint hash = HashCell3D(originCell + offsets3D[offsetIdx]);
+        int3 cell = originCell + offsets3D[offsetIdx];
+        uint hash = HashCell3D(cell);
         uint key = KeyFromHash(hash, _ParticleCount);
         uint currIndex = _SpatialOffsets[key];
 
@@ -301,16 +346,20 @@ void CalculateColorField(uint3 id : SV_DispatchThreadID)
                 break;
 
             uint neighborIndex = _SortIndices[j];
-            if (i == neighborIndex)
+            if (i == neighborIndex || neighborIndex >= _FluidCount)
                 continue;
 
-            float3 offset = _PredictedPositions[neighborIndex] - pos;
+            float3 neighborPosition = _PredictedPositions[neighborIndex];
+            float3 offset = neighborPosition - pos;
             float distanceSquared = dot(offset, offset);
             if (distanceSquared >= radiusSquared || distanceSquared < 1e-8f)
                 continue;
 
+            if (any(GetCell3D(neighborPosition, _SmoothingRadius) != cell))
+                continue;
+
             float densityJ = max(_Densities[neighborIndex], 0.001f);
-            normal += ColorFieldKernelNormal(offset, distanceSquared, _SmoothingRadius) / densityJ;
+            normal += ColorFieldKernelNormal(-offset, distanceSquared, _SmoothingRadius) / densityJ;
             laplacian += ColorFieldKernelLaplacian(distanceSquared, _SmoothingRadius) / densityJ;
         }
     }
@@ -323,7 +372,7 @@ void CalculateColorField(uint3 id : SV_DispatchThreadID)
 void CalculateSurfaceTension(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidCount)
         return;
 
     float3 normal = _ColorFieldNormals[i];
@@ -345,65 +394,79 @@ void CalculateSurfaceTension(uint3 id : SV_DispatchThreadID)
 void UpdateVelocities(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidCount)
         return;
 
-    float3 totalForce = _PressureForces[i] + _NearPressureForces[i] + _SurfaceTensionForces[i];
+    float3 totalForce = _PressureForces[i];
+    if (_SurfaceTensionCoefficient > 0.0001f)
+        totalForce += _SurfaceTensionForces[i];
+
     float3 acceleration = totalForce / max(_Densities[i], 0.0001f);
+    acceleration += _NearPressureAccelerations[i] + _ViscosityForces[i];
     _Velocities[i] += acceleration * _DeltaTime;
-    _Velocities[i] += _ViscosityForces[i] * _DeltaTime;
 }
 
 [numthreads(128, 1, 1)]
 void UpdatePositions(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidCount)
         return;
 
     float3 velocity = _Velocities[i];
+
+    // Speed cap: stops a single bad force spike from launching a particle
+    float maxSpeed = 0.5f * _SmoothingRadius / _DeltaTime;
+    velocity = clamp(velocity, float3(-maxSpeed, -maxSpeed, -maxSpeed),
+                               float3(maxSpeed, maxSpeed, maxSpeed));
+
     float3 position = _Positions[i] + velocity * _DeltaTime;
 
-    float halfWidth  = _SimulationBounds.x * 0.5f;
+    float halfWidth = _SimulationBounds.x * 0.5f;
     float halfHeight = _SimulationBounds.y * 0.5f;
-    float halfDepth  = _SimulationBounds.z * 0.5f;
+    float halfDepth = _SimulationBounds.z * 0.5f;
 
     if (position.x - _ParticleRadius < -halfWidth)
     {
         position.x = -halfWidth + _ParticleRadius;
-        if (velocity.x < 0.0f) velocity.x *= -_DampingFactor;
+        if (velocity.x < 0.0f)
+            velocity.x *= -_DampingFactor;
     }
     else if (position.x + _ParticleRadius > halfWidth)
     {
         position.x = halfWidth - _ParticleRadius;
-        if (velocity.x > 0.0f) velocity.x *= -_DampingFactor;
+        if (velocity.x > 0.0f)
+            velocity.x *= -_DampingFactor;
     }
 
     if (position.y - _ParticleRadius < -halfHeight)
     {
         position.y = -halfHeight + _ParticleRadius;
-        if (velocity.y < 0.0f) velocity.y *= -_DampingFactor;
+        if (velocity.y < 0.0f)
+            velocity.y *= -_DampingFactor;
     }
     else if (position.y + _ParticleRadius > halfHeight)
     {
         position.y = halfHeight - _ParticleRadius;
-        if (velocity.y > 0.0f) velocity.y *= -_DampingFactor;
+        if (velocity.y > 0.0f)
+            velocity.y *= -_DampingFactor;
     }
 
     if (position.z - _ParticleRadius < -halfDepth)
     {
         position.z = -halfDepth + _ParticleRadius;
-        if (velocity.z < 0.0f) velocity.z *= -_DampingFactor;
+        if (velocity.z < 0.0f)
+            velocity.z *= -_DampingFactor;
     }
     else if (position.z + _ParticleRadius > halfDepth)
     {
         position.z = halfDepth - _ParticleRadius;
-        if (velocity.z > 0.0f) velocity.z *= -_DampingFactor;
+        if (velocity.z > 0.0f)
+            velocity.z *= -_DampingFactor;
     }
 
     _Velocities[i] = velocity;
     _Positions[i] = position;
-    _PredictedPositions[i] = position; 
 }
 
 float DensityKernel(float r, float h)
@@ -422,6 +485,15 @@ float NearDensityKernel(float distance, float h)
         return 0.0f;
     float diff = 1.0f - q;
     return diff * diff * diff;
+}
+
+float Poly6Kernel(float distance, float h)
+{
+    if (distance >= h)
+        return 0.0f;
+    float diff = h * h - distance * distance;
+    float coeff = 315.0f / (64.0f * 3.14159265f * pow(h, 9));
+    return coeff * diff * diff * diff;
 }
 
 float NearDensityKernelDerivative(float distance, float h)

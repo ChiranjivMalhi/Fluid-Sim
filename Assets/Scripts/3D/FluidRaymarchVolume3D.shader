@@ -16,6 +16,9 @@ Shader "FluidSim/RaymarchVolume3D"
         _SpecularPower ("Specular Power (Gloss)", Range(8.0, 256.0)) = 64.0
         _SunSpecular ("Sun Specular Intensity", Range(0.0, 5.0)) = 1.5
         _AbsorptionDensity ("Absorption Density", Range(0.0, 5.0)) = 1.0
+        _AbsorptionCoefficients ("Absorption Coefficients (RGB)", Vector) = (1, 1, 1, 0)
+        _NormalSampleDistance ("Normal Sample Distance", Float) = 0.05
+        [Toggle] _InteractWithScene ("Use Scene Depth and Color", Float) = 1
         _EnvironmentMap ("Environment Map (Optional)", Cube) = "" {}
     }
 
@@ -24,7 +27,7 @@ Shader "FluidSim/RaymarchVolume3D"
         Tags { "RenderPipeline"="UniversalPipeline" "Queue"="Transparent" "RenderType"="Transparent" }
         Cull Front
         ZWrite Off
-        ZTest LEqual
+        ZTest Always
         Blend SrcAlpha OneMinusSrcAlpha
 
         Pass
@@ -64,6 +67,9 @@ Shader "FluidSim/RaymarchVolume3D"
             float _SpecularPower;
             float _SunSpecular;
             float _AbsorptionDensity;
+            float3 _AbsorptionCoefficients;
+            float _NormalSampleDistance;
+            float _InteractWithScene;
             float _HasEnvironmentMap;
 
             struct Attributes
@@ -88,7 +94,11 @@ Shader "FluidSim/RaymarchVolume3D"
             
             float2 RayBoxDistance(float3 boxMin, float3 boxMax, float3 rayOrigin, float3 rayDirection)
             {
-                float3 invDir = 1.0 / (abs(rayDirection) > 1e-6 ? rayDirection : (sign(rayDirection) * 1e-6 + 1e-6));
+                float3 safeDirection = float3(
+                    rayDirection.x >= 0 ? max(rayDirection.x, 1e-6) : min(rayDirection.x, -1e-6),
+                    rayDirection.y >= 0 ? max(rayDirection.y, 1e-6) : min(rayDirection.y, -1e-6),
+                    rayDirection.z >= 0 ? max(rayDirection.z, 1e-6) : min(rayDirection.z, -1e-6));
+                float3 invDir = 1.0 / safeDirection;
                 float3 t0 = (boxMin - rayOrigin) * invDir;
                 float3 t1 = (boxMax - rayOrigin) * invDir;
                 float3 tMin = min(t0, t1);
@@ -115,7 +125,11 @@ Shader "FluidSim/RaymarchVolume3D"
            
             float3 CalculateNormal(float3 worldPosition)
             {
-                float3 sampleStep = _VolumeBounds / 64.0;
+                uint width, height, depth;
+                _DensityVolume.GetDimensions(width, height, depth);
+                float3 voxelSize = _VolumeBounds / float3(width, height, depth);
+                float spacing = max(max(voxelSize.x, voxelSize.y), voxelSize.z);
+                float3 sampleStep = max(max(_NormalSampleDistance, spacing), 0.001).xxx;
                 float dx = SampleDensity(worldPosition - float3(sampleStep.x, 0, 0)) - SampleDensity(worldPosition + float3(sampleStep.x, 0, 0));
                 float dy = SampleDensity(worldPosition - float3(0, sampleStep.y, 0)) - SampleDensity(worldPosition + float3(0, sampleStep.y, 0));
                 float dz = SampleDensity(worldPosition - float3(0, 0, sampleStep.z)) - SampleDensity(worldPosition + float3(0, 0, sampleStep.z));
@@ -160,22 +174,84 @@ Shader "FluidSim/RaymarchVolume3D"
                 return r0 + (1.0 - r0) * pow(1.0 - cosTheta, _FresnelPower);
             }
 
-            float2 GetRefractionUV(float3 worldPos, float3 refractDir, float distortStrength)
+            bool TraceFluidExit(float3 entry, float3 direction, float3 boxMin, float3 boxMax,
+                float stepSize, out float3 exitPosition, out float opticalDepth)
             {
-                float3 offsetWorldPos = worldPos + refractDir * distortStrength;
+                float maxDistance = RayBoxDistance(boxMin, boxMax, entry, direction).y;
+                float previousDistance = 0;
+                float previousExcess = max(0, SampleDensity(entry) - _SurfaceThreshold);
+                opticalDepth = 0;
+                exitPosition = entry;
 
-                float4 originalClip = TransformWorldToHClip(worldPos);
-                float4 offsetClip   = TransformWorldToHClip(offsetWorldPos);
+                [loop]
+                for (int step = 0; step < _MaxRaySteps; step++)
+                {
+                    float distance = min(previousDistance + stepSize, maxDistance);
+                    float density = SampleDensity(entry + direction * distance);
+                    bool reachedBoundary = distance >= maxDistance;
+                    if (density < _SurfaceThreshold || reachedBoundary)
+                    {
+                        float inside = previousDistance;
+                        float outside = distance;
+                        if (density < _SurfaceThreshold)
+                        {
+                            for (int refine = 0; refine < 4; refine++)
+                            {
+                                float midpoint = (inside + outside) * 0.5;
+                                if (SampleDensity(entry + direction * midpoint) >= _SurfaceThreshold)
+                                    inside = midpoint;
+                                else
+                                    outside = midpoint;
+                            }
+                        }
+                        float exitDistance = density < _SurfaceThreshold ? (inside + outside) * 0.5 : distance;
+                        opticalDepth += previousExcess * (exitDistance - previousDistance) * 0.5;
+                        exitPosition = entry + direction * exitDistance;
+                        return true;
+                    }
 
-                float2 originalUV = (originalClip.xy / originalClip.w) * 0.5 + 0.5;
-                float2 offsetUV   = (offsetClip.xy / offsetClip.w) * 0.5 + 0.5;
+                    float excess = max(0, density - _SurfaceThreshold);
+                    opticalDepth += (previousExcess + excess) * 0.5 * (distance - previousDistance);
+                    previousDistance = distance;
+                    previousExcess = excess;
+                }
 
-                #if UNITY_UV_STARTS_AT_TOP
-                originalUV.y = 1.0 - originalUV.y;
-                offsetUV.y   = 1.0 - offsetUV.y;
-                #endif
+                exitPosition = entry + direction * previousDistance;
+                return false;
+            }
 
-                return offsetUV;
+            // Project the exiting ray into the opaque scene image and refine its depth estimate.
+            float3 SampleRefractedScene(float3 exitPosition, float3 direction,
+                float3 cameraForward, float3 lightDir)
+            {
+                float3 fallback = SampleEnvironment(direction, lightDir);
+                if (_InteractWithScene < 0.5)
+                    return fallback;
+
+                float forwardAmount = dot(direction, cameraForward);
+                if (forwardAmount <= 0.001)
+                    return fallback;
+
+                float exitEyeDepth = -TransformWorldToView(exitPosition).z;
+                float distance = max(_RayStepSize, 0.01);
+                float2 uv = 0;
+                for (int iteration = 0; iteration < 4; iteration++)
+                {
+                    float3 samplePosition = exitPosition + direction * distance;
+                    float4 clip = TransformWorldToHClip(samplePosition);
+                    if (clip.w <= 0)
+                        return fallback;
+                    float4 screenPosition = ComputeScreenPos(clip);
+                    uv = screenPosition.xy / screenPosition.w;
+                    if (any(uv < 0) || any(uv > 1))
+                        return fallback;
+                    float rawDepth = SAMPLE_TEXTURE2D(_CameraDepthTexture, sampler_CameraDepthTexture, uv).r;
+                    float eyeDepth = LinearEyeDepth(rawDepth, _ZBufferParams);
+                    if (eyeDepth >= _ProjectionParams.z * 0.999 || eyeDepth <= exitEyeDepth)
+                        return fallback;
+                    distance = (eyeDepth - exitEyeDepth) / forwardAmount;
+                }
+                return SAMPLE_TEXTURE2D(_CameraOpaqueTexture, sampler_CameraOpaqueTexture, uv).rgb;
             }
 
             float4 Frag(Varyings input) : SV_Target
@@ -200,7 +276,8 @@ Shader "FluidSim/RaymarchVolume3D"
                 float sceneDistAlongRay = sceneEyeDepth / max(cosAngle, 1e-4);
 
                 float sceneDistInsideBox = sceneDistAlongRay - dstToBox;
-                dstInsideBox = min(dstInsideBox, max(0.0, sceneDistInsideBox));
+                if (_InteractWithScene > 0.5)
+                    dstInsideBox = min(dstInsideBox, max(0.0, sceneDistInsideBox));
 
                 if (dstInsideBox <= 0.0001)
                 {
@@ -260,33 +337,25 @@ Shader "FluidSim/RaymarchVolume3D"
                         {
                             refractDir = normalize(refractDir);
 
-                            float2 refractBox = RayBoxDistance(boxMin, boxMax, position + refractDir * 0.01, refractDir);
-                            float maxRefractDist = refractBox.y;
-                            float refractStepSize = stepSize * 2.0;
-                            float fluidDist = 0.0;
+                            float3 exitPosition;
+                            float opticalDepth;
+                            bool foundExit = TraceFluidExit(position, refractDir, boxMin, boxMax,
+                                stepSize, exitPosition, opticalDepth);
+                            float3 transmittance = exp(-max(_AbsorptionCoefficients, 0) *
+                                max(1.0 - _WaterColor.rgb, 0) * opticalDepth * _AbsorptionDensity);
+                            float3 backgroundLight = SampleEnvironment(refractDir, lightDir);
 
-                            for (int rStep = 0; rStep < 16 && fluidDist < maxRefractDist; rStep++)
+                            if (foundExit)
                             {
-                                float3 rPos = position + refractDir * (fluidDist + refractStepSize);
-                                if (SampleDensity(rPos) < _SurfaceThreshold)
-                                {
-                                    break;
-                                }
-                                fluidDist += refractStepSize;
+                                float3 exitNormal = CalculateNormal(exitPosition);
+                                if (dot(exitNormal, refractDir) < 0)
+                                    exitNormal = -exitNormal;
+                                float3 outgoing = refract(refractDir, -exitNormal, max(_IndexOfRefraction, 1.0001));
+                                if (dot(outgoing, outgoing) > 0.001)
+                                    backgroundLight = SampleRefractedScene(exitPosition, normalize(outgoing), camForward, lightDir);
+                                else
+                                    backgroundLight = SampleEnvironment(reflect(refractDir, exitNormal), lightDir);
                             }
-                            fluidDist = min(fluidDist, maxRefractDist);
-
-                            float3 absorptionColor = 1.0 - _WaterColor.rgb;
-                            float3 transmittance = exp(-absorptionColor * (fluidDist * _AbsorptionDensity));
-
-
-                            float distortStrength = saturate(fluidDist * 0.15); 
-                            float2 refractUV = GetRefractionUV(position, refractDir, distortStrength);
-
-                            float3 sceneColor = SAMPLE_TEXTURE2D(_CameraOpaqueTexture, sampler_CameraOpaqueTexture, refractUV).rgb;
-                            float3 skyColor = SampleEnvironment(refractDir, lightDir);
-                            float3 backgroundLight = sceneColor;
-
 
                             refractionColor = backgroundLight * transmittance + _WaterColor.rgb * (1.0 - transmittance);
                             refractionColor *= _RefractionStrength;

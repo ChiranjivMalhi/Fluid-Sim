@@ -11,6 +11,7 @@ RWTexture3D<float> _DensityVolume;
 uint3 _VolumeResolution;
 float3 _VolumeBounds;
 uint _ParticleCount;
+uint _FluidCount;
 float _SmoothingRadius;
 
 float DensityKernel(float distance, float radius)
@@ -53,6 +54,10 @@ void BuildDensityVolume(uint3 id : SV_DispatchThreadID)
             }
 
             uint particleIndex = _SortIndices[j];
+            if (particleIndex >= _FluidCount)
+            {
+                continue;
+            }
             float3 offset = _Positions[particleIndex] - samplePosition;
             float distanceSquared = dot(offset, offset);
             if (distanceSquared < radiusSquared)

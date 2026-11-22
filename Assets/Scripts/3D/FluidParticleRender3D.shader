@@ -5,8 +5,8 @@ Shader "FluidSim/ParticleInstanced"
         _Color ("Color", Color) = (0.55, 0.9, 1, 1)
         _RestDensity ("Rest Density", Float) = 1000.0
         _DensityScale ("Density Intensity Scale", Float) = 1.5
-        _BaseColor ("Base Color", Color) = (0.55, 0.9, 1, 1)
-        _HighColor ("High Density Color", Color) = (0.2, 0.5, 1, 1)
+        _BaseColor ("Low Speed Color", Color) = (0, 0.2, 1, 1)
+        _HighColor ("High Speed Color", Color) = (1, 0, 0, 1)
         _MaxSpeed ("Max Speed (for color scaling)", Float) = 8.0
     }
     SubShader
@@ -70,8 +70,15 @@ Shader "FluidSim/ParticleInstanced"
 
             float4 frag(v2f i) : SV_Target
             {
-                float4 runtimeColor = lerp(_BaseColor, _HighColor, i.velocityRatio);
-                return float4(runtimeColor.rgb, 1.0);
+                const float3 green = float3(0.0, 1.0, 0.0);
+                const float3 yellow = float3(1.0, 1.0, 0.0);
+                float rampPosition = i.velocityRatio * 3.0;
+
+                if (rampPosition < 1.0)
+                    return float4(lerp(_BaseColor.rgb, green, rampPosition), 1.0);
+                if (rampPosition < 2.0)
+                    return float4(lerp(green, yellow, rampPosition - 1.0), 1.0);
+                return float4(lerp(yellow, _HighColor.rgb, rampPosition - 2.0), 1.0);
             }
             ENDHLSL
         }

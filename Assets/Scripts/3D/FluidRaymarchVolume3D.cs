@@ -10,7 +10,7 @@ public class FluidRaymarchVolume3D : MonoBehaviour
     [SerializeField] private Material raymarchMaterial;
 
     [Header("Density Volume")]
-    [SerializeField, Range(16, 128)] private int volumeResolution = 64;
+    [SerializeField, Range(16, 1024)] private int volumeResolution = 64;
 
     [Header("Raymarch")]
     [SerializeField, Min(8)] private int maxRaySteps = 256;
@@ -26,6 +26,8 @@ public class FluidRaymarchVolume3D : MonoBehaviour
     [SerializeField, Range(8f, 256f)] private float specularPower = 64f;
     [SerializeField, Range(0f, 5f)] private float sunSpecular = 1.5f;
     [SerializeField, Range(0f, 5f)] private float absorptionDensity = 1.0f;
+    [SerializeField] private Vector3 absorptionCoefficients = Vector3.one;
+    [SerializeField, Min(0.001f)] private float normalSampleDistance = 0.05f;
 
     [Header("Scene Interaction")]
     [SerializeField] private bool interactWithSceneGeometry = true;
@@ -36,6 +38,7 @@ public class FluidRaymarchVolume3D : MonoBehaviour
     private static readonly int VolumeBoundsID = Shader.PropertyToID("_VolumeBounds");
     private static readonly int VolumeCenterID = Shader.PropertyToID("_VolumeCenter");
     private static readonly int ParticleCountID = Shader.PropertyToID("_ParticleCount");
+    private static readonly int FluidCountID = Shader.PropertyToID("_FluidCount");
     private static readonly int SmoothingRadiusID = Shader.PropertyToID("_SmoothingRadius");
     private static readonly int PositionsID = Shader.PropertyToID("_Positions");
     private static readonly int SortKeysID = Shader.PropertyToID("_SortKeys");
@@ -99,7 +102,7 @@ public class FluidRaymarchVolume3D : MonoBehaviour
     private void LateUpdate()
     {
         if (!Application.isPlaying) return;
-        if (simulation == null || simulation.PositionsBuffer == null || volumeCompute == null || raymarchMaterial == null)
+        if (simulation == null || simulation.PredictedPositionsBuffer == null || volumeCompute == null || raymarchMaterial == null)
         {
             return;
         }
@@ -158,9 +161,10 @@ public class FluidRaymarchVolume3D : MonoBehaviour
         volumeCompute.SetInts(VolumeResolutionID, volumeResolution, volumeResolution, volumeResolution);
         volumeCompute.SetVector(VolumeBoundsID, bounds);
         volumeCompute.SetInt(ParticleCountID, simulation.ParticleCount);
+        volumeCompute.SetInt(FluidCountID, simulation.FluidCount);
         volumeCompute.SetFloat(SmoothingRadiusID, simulation.SmoothingRadius);
 
-        volumeCompute.SetBuffer(buildDensityKernel, PositionsID, simulation.PositionsBuffer);
+        volumeCompute.SetBuffer(buildDensityKernel, PositionsID, simulation.PredictedPositionsBuffer);
         volumeCompute.SetBuffer(buildDensityKernel, SortKeysID, simulation.SpatialKeysBuffer);
         volumeCompute.SetBuffer(buildDensityKernel, SortIndicesID, simulation.SpatialIndicesBuffer);
         volumeCompute.SetBuffer(buildDensityKernel, SpatialOffsetsID, simulation.SpatialOffsetsBuffer);
@@ -195,6 +199,8 @@ public class FluidRaymarchVolume3D : MonoBehaviour
         raymarchMaterial.SetFloat(SpecularPowerID, specularPower);
         raymarchMaterial.SetFloat(SunSpecularID, sunSpecular);
         raymarchMaterial.SetFloat(AbsorptionDensityID, absorptionDensity);
+        raymarchMaterial.SetVector("_AbsorptionCoefficients", absorptionCoefficients);
+        raymarchMaterial.SetFloat("_NormalSampleDistance", normalSampleDistance);
         raymarchMaterial.SetFloat(InteractWithSceneID, interactWithSceneGeometry ? 1.0f : 0.0f);
 
         if (customEnvironmentMap != null)

@@ -226,8 +226,8 @@ Transform:
   m_GameObject: {fileID: 19028858}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.91921, y: -10.03, z: -0.012749}
-  m_LocalScale: {x: 5.1507, y: 5.1507, z: 5.1507}
+  m_LocalPosition: {x: -0.2, y: -17.1, z: -1.8}
+  m_LocalScale: {x: 6.8893743, y: 5.757179, z: 3.103625}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
@@ -263,24 +263,27 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::FluidSimGPU3D
   simulationCompute: {fileID: 7200000, guid: 7f09d1d764bae564599426c9915b737c, type: 3}
   particleMaterial: {fileID: 2100000, guid: b444cd61d5c90ca4eab5c197c0996631, type: 2}
-  simulationBounds: {x: 15, y: 12, z: 12}
-  particlesX: 30
-  particlesY: 30
-  particlesZ: 20
-  particleSpacing: 0.5
-  particleRadius: 0.05
+  simulationBounds: {x: 43, y: 26, z: 24}
+  particlesX: 40
+  particlesY: 40
+  particlesZ: 40
+  particleSpacing: 0.42
+  particleRadius: 0.21
+  spawnCenter: {x: -12.04, y: -1.85, z: 0}
   sphereLongitudeSegments: 3
   sphereLatitudeSegments: 3
-  gravity: 9.81
-  dampingFactor: 1
+  boundaryWallHeight: 12
+  gravity: 2
+  dampingFactor: 0.3
   simulationTimeStep: 0.01
   maxSubstepsPerFrame: 8
   smoothingRadius: 1
-  restDensity: 10
+  restDensity: 13.92625
   densityScale: 8
-  pressureMultiplier: 30
+  pressureMultiplier: 400
+  maxNegativePressure: 0
   nearPressureMultiplier: 2
-  viscosityMultiplier: 0.2
+  viscosityMultiplier: 0.4
   surfaceTensionCoefficient: 0.1
   surfaceTensionThreshold: 5
   drawParticleSpheres: 0
@@ -385,13 +388,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 293914043}
   serializedVersion: 2
-  m_LocalRotation: {x: 0.22265464, y: 0, z: 0, w: 0.9748974}
-  m_LocalPosition: {x: 0, y: 4.2, z: -19.4}
+  m_LocalRotation: {x: 0.10343864, y: -0, z: -0, w: 0.9946358}
+  m_LocalPosition: {x: -0.72, y: 3.32, z: -40.03}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 25.73, y: 0, z: 0}
+  m_LocalEulerAnglesHint: {x: 11.874, y: 0, z: 0}
 --- !u!114 &293914047
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -483,18 +486,20 @@ MonoBehaviour:
   simulation: {fileID: 36470567}
   volumeCompute: {fileID: 7200000, guid: 3d4ad1b316165824880d89ac440de03d, type: 3}
   raymarchMaterial: {fileID: 2100000, guid: 7f67d1f17251afd46a607019f98cf169, type: 2}
-  volumeResolution: 128
+  volumeResolution: 256
   maxRaySteps: 1024
   rayStepSize: 0.05
   surfaceThreshold: 5
-  waterColor: {r: 0, g: 0.50016594, b: 0.87169814, a: 1}
+  waterColor: {r: 0.28897822, g: 0.7341155, b: 0.93962264, a: 1}
   indexOfRefraction: 1.333
-  reflectionStrength: 1
-  refractionStrength: 1
+  reflectionStrength: 0.54
+  refractionStrength: 0.26
   fresnelPower: 5
   specularPower: 64
   sunSpecular: 1.5
-  absorptionDensity: 1
+  absorptionDensity: 0
+  absorptionCoefficients: {x: 1, y: 1, z: 1}
+  normalSampleDistance: 0.05
   interactWithSceneGeometry: 1
   customEnvironmentMap: {fileID: 0}
 --- !u!1 &1431378505
