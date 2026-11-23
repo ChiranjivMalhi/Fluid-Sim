@@ -9,7 +9,14 @@ The project was built as a hands-on implementation and study of SPH-based fluid 
 <p align="center">
   <img src="Content/README/demo.gif" width="700"> 
 
-https://github.com/user-attachments/assets/733e5c4c-5698-4525-a501-34083e9062d8
+
+
+https://github.com/user-attachments/assets/26330ffd-a2ad-4594-bbee-c53668e41b71
+
+
+
+https://github.com/user-attachments/assets/7ed8fff5-4ba2-47e3-8f07-9a67715731b7
+
 
 
 </p>
