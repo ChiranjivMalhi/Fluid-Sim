@@ -276,11 +276,7 @@ Open the project using Unity and run the relevant scene.
 
 ### Simulation
 
-* **Spatial Hashing / Uniform Grid** — Improve neighbor search efficiency and allow significantly larger particle counts.
 * **Adaptive Time Stepping** — Adjust the simulation timestep based on particle velocity and stability constraints.
-* **Improved Boundary Handling** — Develop more robust particle-boundary interaction methods.
-* **Surface Tension** — Add surface tension forces for more realistic free-surface behavior.
-* **Viscosity Models** — Experiment with more physically accurate viscosity formulations.
 * **Fluid-Object Interaction** — Couple the fluid simulation with rigid bodies and moving obstacles.
 
 ### GPU Performance
@@ -328,11 +324,3 @@ https://docs.nvidia.com/cuda/samples/5_simulations/particles/doc/particles.pdf
 Used as a reference for GPU-based particle simulation techniques.
 
 ---
-
-# Author
-
-**Chiranjiv Malhi**
-
-Computer Graphics · GPU Programming · Fluid Simulation
-
-https://github.com/ChiranjivMalhi
